@@ -1,6 +1,8 @@
 package gatekeep
 
 import (
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -85,5 +87,30 @@ func TestAllow_CapsAtCapacity(t *testing.T) {
 	// The 6th fails — capacity is the ceiling, no matter how long idle.
 	if allowed, _ := l.Allow("user1"); allowed {
 		t.Fatal("expected denial: burst must be capped at capacity")
+	}
+}
+
+func TestAllow_ConcurrentNoOverAdmission(t *testing.T) {
+	const capacity = 100
+	l := NewLimiter(capacity, 1)
+
+	currentTime := time.Now()
+	l.now = func() time.Time { return currentTime }
+
+	const goroutines = 1000
+	var allowed atomic.Int64 // atomic: many goroutines increment it concurrently
+
+	var wg sync.WaitGroup
+	for range goroutines {
+		wg.Go(func() {
+			if ok, _ := l.Allow("user1"); ok {
+				allowed.Add(1)
+			}
+		})
+	}
+	wg.Wait()
+
+	if got := allowed.Load(); got != capacity {
+		t.Fatalf("allowed = %d, want exactly %d (over-admission under concurrency)", got, capacity)
 	}
 }
