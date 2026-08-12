@@ -21,9 +21,7 @@ func (l *Limiter) Middleware(identifyFn func(*http.Request) string) func(http.Ha
 				sec := int(math.Ceil(retryAfter.Seconds()))
 
 				// if less than 1, round to 1 (user have to wait atleat one second)
-				if sec < 1 {
-					sec = 1
-				}
+				sec = max(sec, 1)
 
 				// modify Header before writing http Error, otherwise the Header will not be included in response
 				w.Header().Set("Retry-After", strconv.Itoa(sec))
