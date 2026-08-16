@@ -55,16 +55,51 @@ type RedisLimiter struct {
 	rate     float64
 	ttl      time.Duration
 	now      func() time.Time
+
+	// failOpen decides what Allow returns when it has no token count it can trust.
+	// true allows the request, false denies it.
+	//
+	// "No token count it can trust" is wider than "Redis is down". It covers three cases:
+	//   1. the call to Redis failed (connection refused, socket died)
+	//   2. Redis answered, but the response had the wrong shape or types
+	//   3. Redis answered, but a value would not parse
+	//
+	// Case 1 is Redis failing. Cases 2 and 3 are a bug in this file -
+	// the Lua script and this Go code disagreeing about the response. Redis did nothing wrong there.
+	//
+	// They share one setting because the outcome is the same in all three:
+	// no token count, and Allow still has to return a decision.
+	//
+	// This does NOT affect a normal deny. When Redis answers correctly and the bucket is empty, Allow denies the request at the bottom of the function
+	// and failOpen is never read.
+	failOpen bool
 }
 
 func NewRedisLimiter(client *redis.Client, capacity, ratePerSec float64) *RedisLimiter {
-	// TTL: how long an idle key survives in Redis.
-	// A full bucket tells us nothing - deleting it is the same as keeping it,
-	// because a missing key starts full anyway. So we can delete after the
-	// bucket has had time to refill: capacity/rate seconds.
-	// Doubled for margin, and floored at 1 second because Redis EXPIRE only
-	// accepts whole seconds : a sub-second TTL rounds to 0, which deletes the
-	// key immediately and would disable limiting entirely.
+	// TTL: how long an idle bucket survives in Redis.
+	//
+	// Why an idle bucket is safe to delete: a missing key starts full - see the
+	// `tokens == nil` branch in the script. So once a bucket has had time to
+	// refill to capacity, "stored state" and "no state" mean the same thing, and
+	// deleting it loses nothing.
+	//
+	// Refilling from empty takes capacity/rate seconds. That is the earliest
+	// point deletion is safe.
+	//
+	// Why doubled: Allow sends this as whole seconds via int(l.ttl.Seconds()),
+	// which truncates - a 2.9s TTL goes out as 2. Truncation always shortens, so
+	// the key can expire while the bucket is still partially drained. A drained
+	// bucket that disappears comes back full, which hands the client free tokens.
+	// Doubling absorbs the truncation loss.
+	//
+	// The two failure directions are not equal. Expiring too late wastes a little
+	// memory. Expiring too early lets a client past the limit. So bias long.
+	//
+	// Why floored at one second: EXPIRE takes an integer, and int(0.4) is 0.
+	// EXPIRE with 0 deletes the key immediately, so every request would build a
+	// fresh full bucket and the limiter would allow everything. This is reachable
+	// with ordinary settings - capacity 2 at rate 10/s gives 0.2s, doubled to
+	// 0.4s, truncated to 0.
 	ttl := max(time.Second, 2*time.Duration(capacity/ratePerSec*float64(time.Second)))
 
 	return &RedisLimiter{
@@ -74,7 +109,15 @@ func NewRedisLimiter(client *redis.Client, capacity, ratePerSec float64) *RedisL
 		rate:     ratePerSec,
 		ttl:      ttl,
 		now:      time.Now,
+		failOpen: true,
 	}
+}
+
+func (l *RedisLimiter) onError(err error) (bool, time.Duration, error) {
+	if l.failOpen {
+		return true, 0, err
+	}
+	return false, 0, err
 }
 
 func (l *RedisLimiter) Allow(ctx context.Context, id string) (bool, time.Duration, error) {
@@ -89,27 +132,28 @@ func (l *RedisLimiter) Allow(ctx context.Context, id string) (bool, time.Duratio
 	).Slice() // returns ([]any, error)
 
 	if err != nil {
-		return false, 0, err
+		return l.onError(err)
 	}
 
 	if len(res) != 3 {
-		return false, 0, fmt.Errorf("expected 3 values from script, got %d", len(res))
+		return l.onError(fmt.Errorf("expected 3 values from script, got %d", len(res)))
 	}
 
+	// if ok is false, allowed holds 0 - the zero value, not an actual denial of request from Redis
 	allowed, ok := res[0].(int64)
 	if !ok {
-		return false, 0, fmt.Errorf("unexpected type for allowed: %T", res[0])
+		return l.onError(fmt.Errorf("unexpected type for allowed: %T", res[0]))
 	}
 
 	// skipping res[1]: tokens because token count is not used for anything as of now
 
 	waitStr, ok := res[2].(string)
 	if !ok {
-		return false, 0, fmt.Errorf("unexpected type for wait: %T", res[2])
+		return l.onError(fmt.Errorf("unexpected type for wait: %T", res[2]))
 	}
 	waitSec, err := strconv.ParseFloat(waitStr, 64)
 	if err != nil {
-		return false, 0, fmt.Errorf("parsing wait %q: %w", waitStr, err)
+		return l.onError(fmt.Errorf("parsing wait %q: %w", waitStr, err))
 	}
 
 	if allowed == 1 {
